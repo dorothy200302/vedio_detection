@@ -1,0 +1,9 @@
+# Training settings
+model: yolov8n.pt  # ʹ��Ԥѵ����YOLOv8nģ��
+epochs: 100  # ѵ������
+batch: 16  # ���δ�С
+imgsz: 640  # ����ͼƬ��С
+device: cpu  # ʹ��CPUѵ��
+
+# Dataset
+data: dataset.yaml  # ���ݼ������ļ�

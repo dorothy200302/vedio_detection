@@ -21,12 +21,27 @@ class ChefHatDataset(Dataset):
     def __init__(self, image_dir: str, annotation_file: str, transform=None):
         self.image_dir = image_dir
         self.transform = transforms.Compose([
-            transforms.Resize((640, 640)),  # YOLO默认输入尺寸
+            transforms.Resize((640, 640)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.3),
+            transforms.RandomRotation(30),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+            transforms.RandomAffine(degrees=20, translate=(0.2, 0.2), scale=(0.8, 1.2), shear=10),
+            transforms.RandomPerspective(distortion_scale=0.5, p=0.5),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # ImageNet标准化
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ]) if transform is None else transform
         with open(annotation_file, 'r', encoding='utf-8') as f:
             self.annotations = json.load(f)
+            
+        # 打印数据集统计信息
+        hat_count = sum(1 for ann in self.annotations if ann['has_hat'] == 1)
+        no_hat_count = sum(1 for ann in self.annotations if ann['has_hat'] == 0)
+        print(f"\n数据集统计:")
+        print(f"总图片数: {len(self.annotations)}")
+        print(f"戴帽子图片: {hat_count}")
+        print(f"不戴帽子图片: {no_hat_count}")
+        print(f"正负样本比例: {hat_count/no_hat_count:.2f}")
     
     def __len__(self):
         return len(self.annotations)
@@ -61,25 +76,53 @@ class ChefHatDetector:
         try:
             print("正在初始化模型...")
             # 完全禁用COCO数据集下载
-            os.environ['YOLO_VERBOSE'] = 'False'  # 禁用YOLO的verbose输出
+            os.environ['YOLO_VERBOSE'] = 'False'
             self.model = YOLO("yolov8n.pt", task='detect')
-            self.model.overrides['data'] = None  # 禁用数据集下载
-            self.model.overrides['resume'] = False  # 禁用恢复训练
-            self.model.overrides['pretrained'] = False  # 禁用预训练数据集
+            self.model.overrides['data'] = None
+            self.model.overrides['resume'] = False
+            self.model.overrides['pretrained'] = False
             
             # 确保模型参数可以计算梯度
             for param in self.model.parameters():
                 param.requires_grad = True
             
-            # 添加一个用于二分类的头部
-            self.classifier = nn.Sequential(
-                nn.Linear(256, 128),  # 使用固定的特征维度
+            # 使用更复杂的分类器
+            self.feature_extractor = nn.Sequential(
+                nn.Conv2d(3, 64, kernel_size=3, padding=1),
+                nn.BatchNorm2d(64),
                 nn.ReLU(),
-                nn.Dropout(0.5),
-                nn.Linear(128, 64),
+                nn.MaxPool2d(2),
+                
+                nn.Conv2d(64, 128, kernel_size=3, padding=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                
+                nn.Conv2d(128, 256, kernel_size=3, padding=1),
+                nn.BatchNorm2d(256),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                
+                nn.AdaptiveAvgPool2d((1, 1))
+            )
+            
+            self.classifier = nn.Sequential(
+                nn.Linear(256, 512),
+                nn.BatchNorm1d(512),
                 nn.ReLU(),
                 nn.Dropout(0.3),
-                nn.Linear(64, 1)
+                
+                nn.Linear(512, 256),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                
+                nn.Linear(256, 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                
+                nn.Linear(128, 1)
             )
             
             # 初始化LoRA层
@@ -139,20 +182,7 @@ class ChefHatDetector:
         """前向传播"""
         try:
             # 使用卷积层提取特征
-            conv_layers = nn.Sequential(
-                nn.Conv2d(3, 64, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.MaxPool2d(2),
-                nn.Conv2d(64, 128, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.MaxPool2d(2),
-                nn.Conv2d(128, 256, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.AdaptiveAvgPool2d((1, 1))
-            ).to(x.device)
-            
-            # 提取特征
-            features = conv_layers(x)
+            features = self.feature_extractor(x)
             features = features.view(features.size(0), -1)
             
             # 通过分类器
@@ -245,7 +275,7 @@ class ChefHatDetector:
         
         return metrics
     
-    def train_lora(self, train_dataset: ChefHatDataset, epochs=10, batch_size=16, learning_rate=1e-3, val_split=0.2):
+    def train_lora(self, train_dataset: ChefHatDataset, epochs=30, batch_size=8, learning_rate=2e-4, val_split=0.2):
         """训练LoRA层并进行评估"""
         try:
             print("开始LoRA训练...")
@@ -255,63 +285,90 @@ class ChefHatDetector:
             train_size = len(train_dataset) - val_size
             train_subset, val_subset = random_split(train_dataset, [train_size, val_size])
             
-            train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
+            # 使用weighted sampler来处理类别不平衡
+            labels = [train_dataset[i][1].item() for i in train_subset.indices]
+            class_counts = np.bincount(labels)
+            class_weights = 1. / torch.tensor(class_counts, dtype=torch.float)
+            weights = class_weights[labels]
+            sampler = torch.utils.data.WeightedRandomSampler(weights, len(weights))
+            
+            train_loader = DataLoader(
+                train_subset, 
+                batch_size=batch_size, 
+                sampler=sampler,
+                num_workers=4,
+                pin_memory=True
+            )
             
             # 训练所有参数
-            parameters = list(self.classifier.parameters())
-            for lora_layer in self.lora_layers.values():
-                parameters.extend([lora_layer.lora_A, lora_layer.lora_B])
+            parameters = (
+                list(self.feature_extractor.parameters()) + 
+                list(self.classifier.parameters()) +
+                [param for lora_layer in self.lora_layers.values() for param in [lora_layer.lora_A, lora_layer.lora_B]]
+            )
             
+            # 使用AdamW优化器和余弦退火学习率调度器
             optimizer = optim.AdamW(parameters, lr=learning_rate, weight_decay=0.01)
-            criterion = nn.BCEWithLogitsLoss()
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
+            scheduler = optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=learning_rate,
+                epochs=epochs,
+                steps_per_epoch=len(train_loader),
+                pct_start=0.3,
+                anneal_strategy='cos'
+            )
+            
+            # 使用带权重的BCE损失
+            criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([class_weights[1]/class_weights[0]]))
             
             best_f1 = 0.0
+            patience = 5  # 早停的耐心值
+            no_improve = 0  # 没有改善的轮数
+            
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.feature_extractor.to(device)
             self.classifier.to(device)
             
             print(f"\n训练集大小: {len(train_subset)}")
             print(f"验证集大小: {len(val_subset)}")
+            print(f"类别分布: 无帽子 - {class_counts[0]}, 有帽子 - {class_counts[1]}")
+            print(f"使用设备: {device}")
             
             # 训练循环
             for epoch in range(epochs):
-                total_loss = 0
-                self.model.eval()  # YOLO模型设为评估模式
+                # 训练阶段
+                self.model.eval()
+                self.feature_extractor.train()
                 self.classifier.train()
                 
+                total_loss = 0
+                batch_count = 0
+                
                 for batch_idx, (images, labels) in enumerate(train_loader):
-                    # 将数据移到设备上
                     images = images.to(device)
                     labels = labels.to(device)
                     
                     optimizer.zero_grad()
-                    
-                    # 前向传播
                     outputs = self.forward(images)
                     loss = criterion(outputs, labels)
                     
-                    # 反向传播
                     loss.backward()
-                    
-                    # 梯度裁剪
                     torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
-                    
                     optimizer.step()
+                    scheduler.step()
                     
                     total_loss += loss.item()
+                    batch_count += 1
                     
                     if batch_idx % 5 == 0:
-                        print(f"Epoch {epoch+1}/{epochs}, Batch {batch_idx}, Loss: {loss.item():.4f}")
+                        print(f"Epoch {epoch+1}/{epochs}, Batch {batch_idx}, Loss: {loss.item():.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
                 
-                avg_loss = total_loss / len(train_loader)
+                avg_loss = total_loss / batch_count
                 self.metrics['train_loss'].append(avg_loss)
                 
-                # 在验证集上评估
+                # 验证阶段
                 print("\n开始验证...")
                 metrics = self.evaluate_model(val_subset)
-                
-                # 更新学习率
-                scheduler.step(metrics['f1_score'])
                 
                 self.metrics['val_accuracy'].append(metrics['accuracy'])
                 self.metrics['val_precision'].append(metrics['precision'])
@@ -326,22 +383,25 @@ class ChefHatDetector:
                 print(f"Recall: {metrics['recall']:.4f}")
                 print(f"F1-score: {metrics['f1_score']:.4f}")
                 print(f"AUC: {metrics['auc']:.4f}")
-                print(f"当前学习率: {optimizer.param_groups[0]['lr']:.6f}")
                 
-                # 保存最佳模型
+                # 检查是否需要保存最佳模型
                 if metrics['f1_score'] > best_f1:
                     best_f1 = metrics['f1_score']
                     self.save_lora_weights("./best_lora_weights.pth")
                     print("保存新的最佳模型")
+                    no_improve = 0
+                else:
+                    no_improve += 1
+                    if no_improve >= patience:
+                        print(f"\n{patience}轮未见改善，提前停止训练")
+                        break
                 
-            # 绘制训练过程中的指标变化
-            self.plot_training_metrics()
+                # 每轮都保存训练曲线
+                self.plot_training_metrics()
             
             print("\nLoRA训练完成！")
+            print(f"最佳F1分数: {best_f1:.4f}")
             print("最佳模型权重已保存到 best_lora_weights.pth")
-            print("评估指标已保存到 results/evaluation_metrics.json")
-            print("ROC曲线已保存到 results/roc_curve.png")
-            print("训练过程指标图已保存到 results/training_metrics.png")
             
         except Exception as e:
             print(f"训练LoRA时出错: {str(e)}")
@@ -401,30 +461,47 @@ class ChefHatDetector:
             print("未找到LoRA权重文件")
 
     def detect_chef_hat(self, frame: np.ndarray, person_box: List[float], conf_threshold: float = 0.3) -> Dict:
-        """使用更复杂的方法检测厨师帽"""
+        """使用更复杂的方法检测厨师帽和人头"""
         try:
             x1, y1, x2, y2 = [int(coord) for coord in person_box]
             
             # 扩大头部检测区域（上部30%的区域）
             head_height = int((y2 - y1) * 0.3)
-            head_y1 = max(0, y1 - head_height//2)  # 向上扩展一些
+            head_y1 = max(0, y1 - head_height//2)
             head_y2 = y1 + head_height
-            head_x1 = max(0, x1 - 20)  # 向两边扩展一些
+            head_x1 = max(0, x1 - 20)
             head_x2 = min(frame.shape[1], x2 + 20)
             
             # 提取头部区域
             head_region = frame[head_y1:head_y2, head_x1:head_x2]
             if head_region.size == 0:
-                return {"has_hat": False, "confidence": 0.0, "type": "unknown"}
+                return {"has_head": False, "has_hat": False, "confidence": 0.0, "type": "unknown"}
             
-            # 转换到HSV空间
+            # 使用肤色检测判断是否有人头
+            # 转换到YCrCb空间进行肤色检测
+            ycrcb = cv2.cvtColor(head_region, cv2.COLOR_BGR2YCrCb)
+            # 肤色范围
+            min_YCrCb = np.array([0, 133, 77], np.uint8)
+            max_YCrCb = np.array([235, 173, 127], np.uint8)
+            
+            # 创建肤色蒙版
+            skin_mask = cv2.inRange(ycrcb, min_YCrCb, max_YCrCb)
+            
+            # 计算肤色区域比例
+            skin_ratio = np.sum(skin_mask > 0) / (head_region.shape[0] * head_region.shape[1])
+            has_head = skin_ratio > 0.15  # 如果肤色区域超过15%，认为检测到人头
+            
+            if not has_head:
+                return {"has_head": False, "has_hat": False, "confidence": 0.0, "type": "unknown"}
+            
+            # 转换到HSV空间检测帽子
             hsv = cv2.cvtColor(head_region, cv2.COLOR_BGR2HSV)
             
             # 定义不同颜色的帽子范围
             color_ranges = {
-                "white": ([0, 0, 180], [180, 30, 255]),    # 白色帽子
-                "black": ([0, 0, 0], [180, 255, 50]),      # 黑色帽子
-                "blue": ([100, 50, 50], [130, 255, 255]),  # 蓝色帽子
+                "white": ([0, 0, 180], [180, 30, 255]),
+                "black": ([0, 0, 0], [180, 255, 50]),
+                "blue": ([100, 50, 50], [130, 255, 255]),
             }
             
             best_confidence = 0.0
@@ -434,27 +511,18 @@ class ChefHatDetector:
             # 检查每种颜色
             for color_name, (lower, upper) in color_ranges.items():
                 mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
-                
-                # 使用形态学操作改善检测
                 kernel = np.ones((5,5), np.uint8)
                 mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-                
-                # 计算颜色区域比例
                 ratio = np.sum(mask > 0) / (head_region.shape[0] * head_region.shape[1])
                 
                 if ratio > best_confidence:
                     best_confidence = ratio
                     best_color = color_name
             
-            # 判断是否戴帽子
             has_hat = best_confidence > conf_threshold
             
-            # 保存调试图像
-            if has_hat:
-                debug_path = os.path.join(self.results_folder, f"debug_hat_{int(time.time())}.jpg")
-                cv2.imwrite(debug_path, head_region)
-            
             return {
+                "has_head": True,
                 "has_hat": has_hat,
                 "confidence": float(best_confidence),
                 "type": best_color if has_hat else "none"
@@ -462,45 +530,39 @@ class ChefHatDetector:
             
         except Exception as e:
             print(f"检测帽子时出错: {str(e)}")
-            return {"has_hat": False, "confidence": 0.0, "type": "error"}
+            return {"has_head": False, "has_hat": False, "confidence": 0.0, "type": "error"}
 
     def process_frame(self, frame: np.ndarray) -> Dict:
         """处理单个视频帧"""
         try:
-            # 运行目标检测
-            results = self.model(frame, conf=0.25)  # 降低置信度阈值以检测更多目标
+            results = self.model(frame, conf=0.25)
             
-            # 获取检测结果
             detections = []
-            total_persons = 0
-            persons_with_hat = 0
+            total_heads = 0
+            heads_with_hat = 0
             
             for r in results:
                 boxes = r.boxes
                 for box in boxes:
-                    # 获取类别
                     cls = int(box.cls[0].cpu().numpy())
                     cls_name = self.model.names[cls]
-                    
-                    # 获取置信度
                     conf = float(box.conf[0].cpu().numpy())
-                    
-                    # 获取边界框
                     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                     
-                    # 如果检测到人物
                     if cls_name == "person":
-                        total_persons += 1
-                        # 检测帽子
+                        # 检测帽子和人头
                         hat_result = self.detect_chef_hat(frame, [x1, y1, x2, y2])
                         
-                        if hat_result["has_hat"]:
-                            persons_with_hat += 1
+                        # 只有检测到人头时才计入统计
+                        if hat_result["has_head"]:
+                            total_heads += 1
+                            if hat_result["has_hat"]:
+                                heads_with_hat += 1
                         
-                        # 保存人物检测结果
                         detection = {
                             "bbox": [float(x1), float(y1), float(x2), float(y2)],
                             "confidence": conf,
+                            "has_head": hat_result["has_head"],
                             "has_hat": hat_result["has_hat"],
                             "hat_confidence": hat_result["confidence"],
                             "hat_type": hat_result["type"]
@@ -508,22 +570,23 @@ class ChefHatDetector:
                         detections.append(detection)
                         
                         # 在图像上绘制标注
-                        color = (0, 255, 0) if hat_result["has_hat"] else (0, 0, 255)
-                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                        
-                        status = f"{'戴帽子' if hat_result['has_hat'] else '未戴帽子'} ({hat_result['confidence']:.2f})"
-                        if hat_result["has_hat"]:
-                            status += f" - {hat_result['type']}"
+                        if hat_result["has_head"]:
+                            color = (0, 255, 0) if hat_result["has_hat"] else (0, 0, 255)
+                            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                             
-                        cv2.putText(frame, status, 
-                                  (int(x1), int(y1) - 10), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                            status = f"{'戴帽子' if hat_result['has_hat'] else '未戴帽子'} ({hat_result['confidence']:.2f})"
+                            if hat_result["has_hat"]:
+                                status += f" - {hat_result['type']}"
+                                
+                            cv2.putText(frame, status, 
+                                      (int(x1), int(y1) - 10), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             
-            # 计算戴帽子的比例
-            hat_ratio = persons_with_hat / total_persons if total_persons > 0 else 0
+            # 计算戴帽子的比例（只考虑检测到人头的情况）
+            hat_ratio = heads_with_hat / total_heads if total_heads > 0 else 0
             
-            # 在图像上方显示总体统计信息
-            stats_text = f"总人数: {total_persons} | 戴帽子: {persons_with_hat} ({hat_ratio:.1%})"
+            # 在图像上方显示统计信息
+            stats_text = f"检测到的人头数: {total_heads} | 戴帽子: {heads_with_hat} ({hat_ratio:.1%})"
             cv2.putText(frame, stats_text, 
                       (10, 30), 
                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
@@ -532,8 +595,8 @@ class ChefHatDetector:
                 "frame": frame,
                 "detections": detections,
                 "statistics": {
-                    "total_persons": total_persons,
-                    "persons_with_hat": persons_with_hat,
+                    "total_heads": total_heads,
+                    "heads_with_hat": heads_with_hat,
                     "hat_ratio": float(hat_ratio)
                 }
             }
@@ -544,8 +607,8 @@ class ChefHatDetector:
                 "frame": frame,
                 "detections": [],
                 "statistics": {
-                    "total_persons": 0,
-                    "persons_with_hat": 0,
+                    "total_heads": 0,
+                    "heads_with_hat": 0,
                     "hat_ratio": 0.0
                 }
             }
@@ -561,23 +624,20 @@ class ChefHatDetector:
             if not cap.isOpened():
                 return {"error": "无法打开视频文件"}
             
-            # 获取视频信息
             fps = float(cap.get(cv2.CAP_PROP_FPS))
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             
-            # 准备输出视频
             output_path = os.path.join(self.results_folder, f"analyzed_{video_name}")
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
             
-            # 分析结果
             frame_results = []
             total_stats = {
-                "total_frames_with_person": 0,
-                "total_persons": 0,
-                "total_persons_with_hat": 0
+                "total_frames_with_head": 0,
+                "total_heads_detected": 0,
+                "total_heads_with_hat": 0
             }
             
             frame_number = 0
@@ -595,10 +655,10 @@ class ChefHatDetector:
                     result = self.process_frame(frame)
                     
                     # 更新统计信息
-                    if result["statistics"]["total_persons"] > 0:
-                        total_stats["total_frames_with_person"] += 1
-                        total_stats["total_persons"] += result["statistics"]["total_persons"]
-                        total_stats["total_persons_with_hat"] += result["statistics"]["persons_with_hat"]
+                    if result["statistics"]["total_heads"] > 0:
+                        total_stats["total_frames_with_head"] += 1
+                        total_stats["total_heads_detected"] += result["statistics"]["total_heads"]
+                        total_stats["total_heads_with_hat"] += result["statistics"]["heads_with_hat"]
                     
                     frame_results.append({
                         "frame_number": frame_number,
@@ -612,9 +672,9 @@ class ChefHatDetector:
             cap.release()
             out.release()
             
-            # 计算总体统计信息
-            avg_hat_ratio = (total_stats["total_persons_with_hat"] / total_stats["total_persons"] 
-                           if total_stats["total_persons"] > 0 else 0)
+            # 计算总体统计信息（只考虑检测到人头的情况）
+            avg_hat_ratio = (total_stats["total_heads_with_hat"] / total_stats["total_heads_detected"] 
+                           if total_stats["total_heads_detected"] > 0 else 0)
             
             # 生成报告
             report = {
@@ -626,9 +686,9 @@ class ChefHatDetector:
                 },
                 "statistics": {
                     "total_frames_analyzed": len(frame_results),
-                    "frames_with_person": total_stats["total_frames_with_person"],
-                    "total_persons_detected": total_stats["total_persons"],
-                    "total_persons_with_hat": total_stats["total_persons_with_hat"],
+                    "frames_with_head": total_stats["total_frames_with_head"],
+                    "total_heads_detected": total_stats["total_heads_detected"],
+                    "total_heads_with_hat": total_stats["total_heads_with_hat"],
                     "average_hat_ratio": float(avg_hat_ratio)
                 },
                 "frame_results": frame_results,
@@ -653,16 +713,16 @@ class ChefHatDetector:
         
         stats = report["statistics"]
         
-        if stats["total_persons_detected"] == 0:
-            return "未检测到任何人物"
+        if stats["total_heads_detected"] == 0:
+            return "未检测到任何人头"
         
-        hat_ratio = stats["total_persons_with_hat"] / stats["total_persons_detected"] * 100
+        hat_ratio = stats["total_heads_with_hat"] / stats["total_heads_detected"] * 100
         
         summary = f"""分析结果：
 - 总检测帧数：{stats['total_frames_analyzed']}
-- 包含人物的帧数：{stats['frames_with_person']}
-- 检测到的总人数：{stats['total_persons_detected']}
-- 戴帽子的人数：{stats['total_persons_with_hat']} ({hat_ratio:.1f}%)
+- 包含人头的帧数：{stats['frames_with_head']}
+- 检测到的总人头数：{stats['total_heads_detected']}
+- 戴帽子的人头数：{stats['total_heads_with_hat']} ({hat_ratio:.1f}%)
 - 平均戴帽率：{stats['average_hat_ratio']:.1%}
 """
         

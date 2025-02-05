@@ -1,0 +1,8 @@
+# Train/val/test sets
+path: ./yolo_dataset
+train: images/train
+val: images/val
+
+# Classes
+nc: 2  # number of classes
+names: ['no_hat', 'has_hat']  # class names

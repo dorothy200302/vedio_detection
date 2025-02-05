@@ -27,6 +27,13 @@ results/
 *.pth
 *.pt
 dataset/
+datasets/
+runs/
+yolo_dataset/
+*.mp4
+*.jpg
+*.png
+*.csv
 
 # IDE
 .vscode/
