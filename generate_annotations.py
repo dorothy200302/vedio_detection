@@ -39,6 +39,8 @@ def main():
         if not os.path.exists(dataset_dir):
             print(f"错误：数据集目录 {dataset_dir} 不存在")
             return
+
+            
         
         # 扫描图片并生成标注
         print("开始扫描图片...")

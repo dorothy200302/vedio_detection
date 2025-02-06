@@ -4,7 +4,6 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
 build/
 develop-eggs/
 dist/
@@ -21,6 +20,32 @@ wheels/
 .installed.cfg
 *.egg
 
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project specific
+detection_results.json
+output/
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.mp4
+
+# Logs
+*.log
+logs/
+
 # Project specific
 videos/
 results/
@@ -30,16 +55,7 @@ dataset/
 datasets/
 runs/
 yolo_dataset/
-*.mp4
-*.jpg
-*.png
 *.csv
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
 
 # OS
 .DS_Store

@@ -1,0 +1,6 @@
+path: .
+train: images/train
+val: images/val
+
+nc: 2  # number of classes
+names: ['safety_hat', 'no_hat']  # class names
