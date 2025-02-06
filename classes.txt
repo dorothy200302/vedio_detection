@@ -1,2 +1,0 @@
-safety_hat
-no_hat 

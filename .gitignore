@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
+env/
 build/
 develop-eggs/
 dist/
@@ -23,40 +24,39 @@ wheels/
 # Environment
 .env
 .venv
-env/
 venv/
 ENV/
 
 # IDE
-.idea/
 .vscode/
+.idea/
 *.swp
 *.swo
 
-# Project specific
-detection_results.json
-output/
-*.jpg
-*.jpeg
-*.png
-*.gif
-*.mp4
+# OS
+.DS_Store
+Thumbs.db
 
 # Logs
 *.log
 logs/
+
+# Large files
+*.zip
+datasets/coco2017labels-segments.zip
+datasets/coco8
+
+# Custom ignores
+detection_results.json
 
 # Project specific
 videos/
 results/
 *.pth
 *.pt
-dataset/
-datasets/
 runs/
 yolo_dataset/
-*.csv
-
-# OS
-.DS_Store
-Thumbs.db 
+*.mp4
+*.jpg
+*.png
+*.csv 
